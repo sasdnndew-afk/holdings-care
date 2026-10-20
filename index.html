@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="보유케어">
+<meta name="mobile-web-app-capable" content="yes">
+<title>보유종목 케어</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--line:#e6e8ec;--text:#1b1e25;--sub:#7b8190;--blue:#093687}
+@media(prefers-color-scheme:dark){:root{--bg:#12141a;--card:#1c1f27;--line:#2c303a;--text:#e8eaf0;--sub:#9aa1b0;--blue:#6c9bff}}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{font-family:system-ui,"Malgun Gothic",sans-serif;margin:0;padding:12px max(12px,env(safe-area-inset-right)) max(24px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));background:var(--bg);color:var(--text);line-height:1.5}
+h1{color:var(--blue);font-size:1.3em;margin:4px 0 10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin:10px 0}
+.hd{display:flex;justify-content:space-between;align-items:center;gap:8px}.sym{font-weight:700;font-size:1.05em}
+.st{font-weight:700}.st.EXIT{color:#d60000}.st.TRIM{color:#b8860b}.st.WARN{color:#e8710a}.st.HOLD{color:#14804a}
+.card.EXIT{border-color:#d60000}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:4px 12px;margin:8px 0}.grid span{color:var(--sub);font-size:.8em;display:block}
+.why{color:var(--sub);font-size:.85em}.acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+form{display:flex;gap:8px;flex-wrap:wrap}form label{flex:1 1 42%;font-size:.8em;color:var(--sub)}
+input,button{font:inherit;font-size:16px;min-height:40px;border:1px solid var(--line);border-radius:6px;padding:6px 10px;background:var(--card);color:var(--text)}
+form input{width:100%}button{cursor:pointer;background:var(--blue);color:#fff;border-color:var(--blue);font-weight:600}
+button.g{background:var(--card);color:var(--text);border-color:var(--line);font-weight:500}form button{flex:1 1 100%}
+#err{color:#d60000;min-height:1.2em}.note{color:var(--sub);font-size:.8em}
+.chart{height:280px;margin-top:8px}
+</style>
+</head>
+<body>
+<h1 id="h">보유종목 케어</h1>
+<form id="f" class="card">
+  <label>종목<input name="symbol" placeholder="BTC / KRW-BTC" required autocapitalize="characters"></label>
+  <label>평단<input name="avg_price" type="number" step="any" min="0" inputmode="decimal" required></label>
+  <label>수량<input name="qty" type="number" step="any" min="0" inputmode="decimal" required></label>
+  <label>매수일<input name="bought_at" type="date" required></label>
+  <button>추가</button>
+</form>
+<div id="err"></div>
+<div id="rows"></div>
+<p class="note" id="meta"></p>
+<p class="note">업비트 코인 전용. 보유 정보는 이 기기 브라우저에만 저장됩니다(서버·GitHub로 전송되지 않음). 화면을 열어 둘 때만 1분마다 갱신되며 텔레그램 알림은 없습니다. 참고용이며 주문은 하지 않습니다.</p>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+<script src="rules.js"></script>
+<script>
+const UP = "https://api.upbit.com/v1", KEY = "hc_holdings", ACK = "hc_acks";
+const LABEL = {EXIT: "전량 매도", TRIM: "일부 매도", WARN: "손절선 근접", HOLD: "보유"};
+const $ = id => document.getElementById(id);
+const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const kstToday = () => new Date(Date.now() + 9 * 36e5).toISOString().slice(0, 10);
+let holdings = load(KEY, []), acks = load(ACK, {}), state = {}, daily = {}, openChart = null;
+
+const get = async (path, params) => {
+  const r = await fetch(`${UP}/${path}?${new URLSearchParams(params)}`);
+  if (!r.ok) throw new Error(`업비트 ${r.status}`);
+  return r.json();
+};
+async function dailyCandles(sym) {  // 하루 단위 캐시(오늘 봉은 판정에서 제외되므로 재조회 불필요)
+  const day = kstToday(), c = daily[sym];
+  if (c && c.day === day) return c.rows;
+  const rows = (await get("candles/days", {market: sym, count: 200})).reverse().map(r =>
+    ({ts: r.candle_date_time_kst.slice(0, 10), open: r.opening_price, high: r.high_price, low: r.low_price, close: r.trade_price}));
+  daily[sym] = {day, rows};
+  return rows;
+}
+function norm(raw) {  // app.py norm_symbol과 동일
+  const s = raw.trim().toUpperCase();
+  if (!s || /^(KRW|USDT|BTC)-/.test(s)) return s;
+  for (const [suf, q] of [["USDT", "USDT"], ["-KRW", "KRW"], ["KRW", "KRW"]])
+    if (s.endsWith(suf) && s.length > suf.length) return `${q}-${s.slice(0, -suf.length)}`;
+  return `KRW-${s}`;
+}
+async function resolve(raw) {
+  let sym = norm(raw);
+  try { await get("ticker", {markets: sym}); }
+  catch (e) { if (!sym.startsWith("USDT-")) throw e; sym = "KRW-" + sym.slice(5); await get("ticker", {markets: sym}); }
+  return sym;
+}
+
+async function refresh() {
+  if (!holdings.length) { state = {}; return render(); }
+  try {
+    const px = Object.fromEntries((await get("ticker", {markets: [...new Set(holdings.map(h => h.symbol))].join(",")})).map(t => [t.market, t.trade_price]));
+    for (const h of holdings) {
+      try { state[h.id] = {price: px[h.symbol], v: evaluate(h, await dailyCandles(h.symbol), px[h.symbol], kstToday())}; }
+      catch (e) { state[h.id] = {price: px[h.symbol], error: e.message}; }
+    }
+    // 손절선은 올라가기만 한다: 새 최고 손절선을 저장(원본 monitor.py와 동일)
+    holdings = holdings.map(h => { const v = state[h.id]?.v; return v && v.stop > h.stop_floor ? {...h, stop_floor: v.stop} : h; });
+    save(KEY, holdings);
+    $("err").textContent = "";
+    $("meta").textContent = "갱신 " + new Date().toLocaleTimeString("ko-KR");
+  } catch (e) { $("err").textContent = "시세 조회 실패: " + e.message; }
+  render();
+}
+
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function render() {
+  const box = $("rows"), alarms = holdings.filter(h => state[h.id]?.v?.status === "EXIT" && !acks[h.id]).length;
+  document.title = (alarms ? `🚨 ${alarms} - ` : "") + "보유종목 케어";
+  box.replaceChildren(...holdings.map(h => {
+    const s = state[h.id] || {}, v = s.v, c = el("div", "card " + (v ? v.status : ""));
+    const hd = el("div", "hd"); hd.append(el("span", "sym", `${h.symbol} (${h.qty})`), el("span", "st " + (v ? v.status : ""), v ? LABEL[v.status] : s.error ? "데이터 지연" : "대기"));
+    const g = el("div", "grid");
+    for (const [k, val] of [["현재가", fmt(s.price)], ["손익", v ? v.pnl_pct.toFixed(1) + "%" : "-"], ["손절선", v ? fmt(v.stop) : "-"], ["다음 익절", v ? (v.next_target ? fmt(v.next_target) : "추적 손절") : "-"]]) {
+      const d = el("div"); d.append(el("span", null, k), el("b", null, val)); g.append(d);
+    }
+    const acts = el("div", "acts"), btn = (t, fn, cls) => { const b = el("button", cls, t); b.onclick = fn; acts.append(b); };
+    btn("차트", () => { openChart = openChart === h.id ? null : h.id; render(); }, "g");
+    if (v && ((v.status === "EXIT" && !acks[h.id]) || v.status === "TRIM")) btn("확인", () => ack(h, v));
+    btn("매도완료", () => sold(h), "g");
+    btn("삭제", () => { if (confirm("삭제할까요?")) { holdings = holdings.filter(x => x.id !== h.id); save(KEY, holdings); render(); } }, "g");
+    c.append(hd, g, el("div", "why", v ? v.reason : s.error || "점검 대기 중"), acts);
+    if (openChart === h.id) { const n = el("div", "chart"); c.append(n); queueMicrotask(() => drawChart(h, n)); }
+    return c;
+  }));
+}
+function ack(h, v) {  // TRIM은 단계 래치(같은 알림 반복 방지), EXIT은 경보 확인 표시
+  if (v.status === "TRIM") { holdings = holdings.map(x => x.id === h.id ? {...x, stage: v.stage} : x); save(KEY, holdings); }
+  else { acks = {...acks, [h.id]: true}; save(ACK, acks); }
+  refresh();
+}
+function sold(h) {
+  const q = parseFloat(prompt("매도한 수량"));
+  if (!(q > 0)) return;
+  holdings = holdings.flatMap(x => x.id !== h.id ? [x] : q >= x.qty ? [] : [{...x, qty: +(x.qty - q).toPrecision(12)}]);
+  save(KEY, holdings); refresh();
+}
+async function drawChart(h, node) {
+  const rows = await dailyCandles(h.symbol), ch = LightweightCharts.createChart(node, {height: 280, autoSize: true,
+    layout: {background: {color: "transparent"}, textColor: getComputedStyle(document.body).color}, grid: {vertLines: {visible: false}, horzLines: {color: "#8884"}}});
+  const cs = ch.addCandlestickSeries({upColor: "#d24f45", downColor: "#1261c4", borderVisible: false, wickUpColor: "#d24f45", wickDownColor: "#1261c4"});
+  cs.setData(rows.map(r => ({time: r.ts, open: r.open, high: r.high, low: r.low, close: r.close})));
+  const v = state[h.id]?.v;
+  cs.createPriceLine({price: h.avg_price, color: "#888", lineStyle: 2, title: "평단"});
+  if (v) cs.createPriceLine({price: v.stop, color: "#d60000", lineWidth: 2, title: "손절선"});
+  if (v?.next_target) cs.createPriceLine({price: v.next_target, color: "#14804a", lineStyle: 2, title: "익절"});
+  ch.timeScale().fitContent();
+}
+
+$("f").onsubmit = async e => {
+  e.preventDefault(); $("err").textContent = "";
+  const d = Object.fromEntries(new FormData(e.target)), btn = e.target.querySelector("button");
+  btn.disabled = true;
+  try {
+    const avg = +d.avg_price, qty = +d.qty;
+    if (!(avg > 0) || !(qty > 0)) throw new Error("평단·수량은 0보다 커야 합니다");
+    const symbol = await resolve(d.symbol).catch(() => { throw new Error("시세 조회 실패: 종목 코드를 확인하세요 (예: BTC, KRW-BTC)"); });
+    if ((await dailyCandles(symbol)).length < MIN_CANDLES + 1) throw new Error(`일봉이 ${MIN_CANDLES}개 이상인 종목만 감시할 수 있습니다 (신규 상장 제외)`);
+    holdings = [...holdings, {id: Date.now(), symbol, market: "coin", avg_price: avg, qty, bought_at: d.bought_at, stage: 0, stop_floor: 0}];
+    save(KEY, holdings); e.target.reset(); await refresh();
+  } catch (err) { $("err").textContent = err.message; }
+  btn.disabled = false;
+};
+refresh(); setInterval(refresh, 60000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>
